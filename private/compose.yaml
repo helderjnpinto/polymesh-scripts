@@ -1,0 +1,289 @@
+networks:
+  polymesh-private:
+
+services:
+
+  uptime-kuma:
+    build:
+      context: images/uptime-kuma
+      args:
+        - IMAGE_NAME=${PP_UPTIME_KUMA_IMAGE}
+    networks:
+      - polymesh-private
+    volumes:
+      - pp-uptime-kuma-data:/app/data
+    ports:
+      - ${PP_UPTIME_KUMA_PORT:-3030}:3001
+    restart: always
+
+  pp-postgres:
+    image: postgres:16.1-alpine
+    networks:
+      - polymesh-private
+    volumes:
+      - pp-psql-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    configs:
+      - source: psql_extensions
+        target: /docker-entrypoint-initdb.d/btree_extension.sql
+        mode: 0555
+
+  subquery-node:
+    image: ${PP_SUBQUERY_IMAGE}
+    depends_on:
+      pp-postgres:
+        condition: service_healthy
+      polymesh-private:
+        condition: service_healthy
+    networks:
+      - polymesh-private
+    restart: on-failure
+    environment:
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: postgres
+      DB_HOST: pp-postgres
+      DB_PORT: 5432
+      START_BLOCK: 1
+      NETWORK_ENDPOINT: "ws://polymesh-private:9944"
+      NETWORK_HTTP_ENDPOINT: "http://polymesh-private:9933"
+    command:
+      - -f=/app
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://subquery-node:3000/ready"]
+      interval: 20s
+      timeout: 5s
+      retries: 20
+      start_period: 80s
+  
+  subquery-graphql:
+    image: ${PP_SUBQUERY_GRAPHQL_IMAGE}
+    depends_on:
+      subquery-node:
+        condition: service_healthy
+      pp-postgres:
+        condition: service_healthy
+    networks:
+      - polymesh-private
+    ports:
+      - ${PP_SUBQUERY_GRAPHQL_PORT:-3000}:3000
+    restart: on-failure
+    environment:
+      DB_DATABASE: postgres
+      DB_HOST: pp-postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASS: postgres
+      PORT: 3000
+      SUBQL_QUERY_INDEXER: http://subquery-node:3000
+      SUBQL_QUERY_NAME: public
+      SUBQL_QUERY_OUTPUT_FMT: json
+      SUBQL_QUERY_PLAYGROUND: true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "subquery-graphql:3000/.well-known/apollo/server-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  polymesh-private:
+    image: ${PP_CHAIN_IMAGE}
+    networks:
+      - polymesh-private
+    ports:
+      - ${PP_CHAIN_WS_PORT:-9944}:9944
+      - ${PP_CHAIN_RPC_PORT:-9933}:9933
+      - ${PP_CHAIN_P2P_PORT:-30333}:30333
+    volumes:
+      - pp-chain-data:/var/lib/polymesh-private
+    command:
+      - --dev
+      - --rpc-external
+      - --ws-external
+      - --base-path=/var/lib/polymesh-private
+    configs:
+      - source: polymesh-healthcheck-libp2p
+        target: /usr/local/bin/polymesh-healthcheck-libp2p.sh
+        mode: 0555
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/polymesh-healthcheck-libp2p.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  polymesh-private-rest-api:
+    image: ${PP_REST_API_IMAGE}
+    depends_on:
+      polymesh-private:
+        condition: service_healthy
+      subquery-graphql:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    networks:
+      - polymesh-private
+    ports:
+      - ${PP_REST_API_PORT:-3001}:3000
+    restart: on-failure
+    volumes:
+      - pp-vault-root-token:/vault-token:ro
+    entrypoint: /bin/sh -c "VAULT_TOKEN=$(cat /vault-token/.token) node dist/main.js"
+    environment:
+      PORT: 3000
+      POLYMESH_NODE_URL: "ws://polymesh-private:9944"
+      POLYMESH_MIDDLEWARE_V2_URL: "http://subquery-graphql:3000"
+      AUTH_STRATEGY: "open"
+      DEVELOPER_UTILS: true
+      VAULT_URL: "http://vault:8200/v1/transit"
+      PROOF_SERVER_URL: "http://polymesh-private-proof-api:8080/api/v1"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://polymesh-private-rest-api:3000/network/latest-block"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  polymesh-private-rest-api-init:
+    image: alpine:3.19
+    depends_on:
+      polymesh-private-rest-api:
+        condition: service_healthy
+    entrypoint: /opt/polymesh-private-rest-api/init.sh
+    networks:
+      - polymesh-private
+    environment:
+      PGPASSWORD: postgres
+      PGUSER: postgres
+      PGDATABASE: services_status
+      PGHOST: pp-postgres
+    volumes:
+      - pp-rest-api-accounts-init:/opt/polymesh-private-rest-api/status
+    configs:
+      - source: rest-api-accounts-init
+        target: /opt/polymesh-private-rest-api/init.sh
+        mode: 0555
+    
+
+  polymesh-private-proof-api:
+    image: ${PP_PROOF_API_IMAGE}
+    networks:
+      - polymesh-private
+    ports:
+      - ${PP_PROOF_API_PORT:-8080}:8080
+    volumes:
+      - pp-proof-api-data:/data
+    restart: always
+    environment:
+      DATABASE_URL: sqlite:/data/confidential_assets.db
+
+  vault:
+    image: hashicorp/vault:${VAULT_VERSION:-latest}
+    networks:
+      - polymesh-private
+    restart: unless-stopped
+    ports:
+      - ${VAULT_PORT:-8200}:8200
+    volumes:
+      - pp-vault-volume:/vault/file:rw
+      - pp-vault-log-volume:/vault/logs:rw
+    cap_add:
+      - IPC_LOCK # Prevents secrets from swapping to disk
+    configs:
+      - source: vault-config
+        target: /vault/config/vault.json
+        mode: 0444
+    entrypoint: vault server -config=/vault/config/vault.json
+
+  # This will make sure vault is initialized and unsealed on the first run and unsealed on subsequent runs
+  vault-init:
+    image: hashicorp/vault:${VAULT_VERSION:-latest}
+    networks:
+      - polymesh-private
+    restart: no
+    depends_on:
+      vault:
+        condition: service_started
+    volumes:
+      - pp-vault-root-token:/vault-token:rw
+    # This will prevent the container from creating additional volumes
+    tmpfs:
+      - /vault/file
+      - /vault/logs
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      PGPASSWORD: postgres
+      PGUSER: postgres
+      PGDATABASE: services_status
+      PGHOST: pp-postgres
+    configs:
+      - source: vault-init
+        target: /opt/vault/init.sh
+        mode: 0555
+      - source: vault-init-dependencies
+        target: /opt/vault/init-dependencies.sh
+        mode: 0555
+    entrypoint: /opt/vault/init-dependencies.sh
+
+configs:
+  psql_extensions:
+    external: false
+    file: ./scripts/psql_extensions.sql
+  polymesh-healthcheck-libp2p:
+    external: false
+    file: ./scripts/polymesh-healthcheck-libp2p.sh
+  vault-config:
+    external: false
+    file: ./scripts/vault-config.json
+  vault-init:
+    external: false
+    file: ./scripts/vault-init.sh
+  vault-init-dependencies:
+    external: false
+    file: ./scripts/vault-init-dependencies.sh
+  rest-api-accounts-init:
+    external: false
+    file: ./scripts/rest-api-accounts-init.sh
+
+volumes:
+  pp-uptime-kuma-data:
+    labels:
+      - "network.polymesh.project=polymesh-private"
+      - "network.polymesh.description=Uptime Kuma data"
+  pp-psql-data:
+    labels:
+      - "network.polymesh.project=polymesh-private"
+      - "network.polymesh.description=Indexer PostgreSQL data"
+  pp-chain-data: 
+    labels:
+      - "network.polymesh.project=polymesh-private"
+      - "network.polymesh.description=Polymesh chain data"
+  pp-vault-volume: 
+    labels:
+      - "network.polymesh.project=polymesh-private"
+      - "network.polymesh.description=Hashicorp Vault data"
+  pp-vault-log-volume: 
+    labels:
+      - "network.polymesh.project=polymesh-private"
+      - "network.polymesh.description=Hashicorp Vault logs"
+  pp-vault-root-token: 
+    labels:
+      - "network.polymesh.project=polymesh-private"
+      - "network.polymesh.description=Hashicorp Vault root token"
+  pp-rest-api-accounts-init: 
+    labels:
+      - "network.polymesh.project=polymesh-private"
+      - "network.polymesh.description=REST API signer init"
+  pp-proof-api-data:
+    labels:
+      - "network.polymesh.project=polymesh-private"
+      - "network.polymesh.description=Proof API data"

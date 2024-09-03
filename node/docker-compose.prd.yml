@@ -1,0 +1,96 @@
+version: '3.8'
+
+services:
+  # Validator Node
+  validator-node:
+    image: polymeshassociation/polymesh:latest-develop-distroless
+    container_name: polymesh-validator-node
+    environment:
+      - NODE_KEY=your_node_key_here
+      - VALIDATOR=true
+    ports:
+      - "30333:30333"
+      - "9933:9933"
+      - "9944:9944"
+    volumes:
+      - ./validator-data:/polymesh-data
+    command: >
+      --base-path /polymesh-data
+      --chain private
+      --name "Polymesh Validator Node"
+      --rpc-cors all
+      --rpc-methods Unsafe
+      --ws-external
+      --rpc-external
+      --validator
+
+  # Archive Node
+  archive-node:
+    image: polymeshassociation/polymesh:latest-develop-distroless
+    container_name: polymesh-archive-node
+    environment:
+      - NODE_KEY=your_node_key_here
+      - ARCHIVE=true
+    ports:
+      - "30334:30334"
+      - "9934:9934"
+      - "9945:9945"
+    volumes:
+      - ./archive-data:/polymesh-data
+    command: >
+      --base-path /polymesh-data
+      --chain private
+      --name "Polymesh Archive Node"
+      --rpc-cors all
+      --rpc-methods Unsafe
+      --ws-external
+      --rpc-external
+      --pruning archive
+
+  # RPC Node
+  rpc-node:
+    image: polymeshassociation/polymesh:latest-develop-distroless
+    container_name: polymesh-rpc-node
+    environment:
+      - NODE_KEY=your_node_key_here
+    ports:
+      - "30335:30335"
+      - "9935:9935"
+      - "9946:9946"
+    volumes:
+      - ./rpc-data:/polymesh-data
+    command: >
+      --base-path /polymesh-data
+      --chain private
+      --name "Polymesh RPC Node"
+      --rpc-cors all
+      --rpc-methods Unsafe
+      --ws-external
+      --rpc-external
+      --pruning 1000
+
+  # Additional Full Node
+  full-node:
+    image: polymeshassociation/polymesh:latest-develop-distroless
+    container_name: polymesh-full-node
+    environment:
+      - NODE_KEY=your_node_key_here
+    ports:
+      - "30336:30336"
+      - "9936:9936"
+      - "9947:9947"
+    volumes:
+      - ./full-node-data:/polymesh-data
+    command: >
+      --base-path /polymesh-data
+      --chain private
+      --name "Polymesh Full Node"
+      --rpc-cors all
+      --rpc-methods Unsafe
+      --ws-external
+      --rpc-external
+
+networks:
+  default:
+    name: polymesh-net
+    driver: bridge
